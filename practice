@@ -1,0 +1,149 @@
+# 1. ライブラリ import
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("device:", device)
+
+# 2. データ読み込み
+df = pd.read_csv("flow_data.csv")
+assert set(["x","y","u","v"]).issubset(df.columns), "CSVに x,y,u,v 列が必要です"
+X_coords = df[["x","y"]].to_numpy()   # 座標
+Y_field  = df[["u","v"]].to_numpy()   # 物理量（速度）
+
+# 3. 前処理（正規化(直行格子とか)）標準化（他のデータ）
+from sklearn.preprocessing import StandardScaler
+# 標準化
+# sc = StandardScaler()
+# 標準化させる値（今回は変数aが標準化する値ですが、x_trainやx_testなどの説明変数を渡す。）
+# a = np.random.randint(10, size=(2,5))
+# X_std = sc.fit_transform(a)
+# print("平均", X_std.mean())
+# print("標準偏差", X_std.std())
+
+def standardize(arr, mean=None, std=None):
+    if mean is None:
+        mean = arr.mean(axis=0)      # 列ごとの平均を計算
+    if std is None:
+        std = arr.std(axis=0)        # 列ごとの標準偏差を計算
+        std[std == 0] = 1.0          # 分散がゼロなら1にしておく（ゼロ割回避）
+
+    return (arr - mean) / std, mean, std
+
+def destandardize(arr_std, mean, std):#標準化逆変換
+    return arr_std * std + mean
+
+def normalize_coords(X, min_=None, max_=None):
+    X = np.asarray(X, dtype=float)
+    if min_ is None: min_ = X.min(axis=0)
+    if max_ is None: max_ = X.max(axis=0)
+    span = (max_ - min_); span[span==0] = 1.0
+    Xn = (X - min_) / span
+    return Xn, min_, max_
+
+def denormalize_coords(Xn, min_, max_):
+    span = (max_ - min_); span[span==0] = 1.0
+    return Xn * span + min_
+
+
+# 座標を正規化、物理量を標準化
+Xn, Xmin, Xmax = normalize_coords(X_coords)
+Yz, Ymean, Ystd = standardize(Y_field)
+
+from sklearn.model_selection import train_test_split
+import numpy as np
+# データセットを分割
+X = torch.tensor(Xn, dtype=torch.float32)
+Y = torch.tensor(Yz, dtype=torch.float32)
+# 80%を学習用、20%をテスト用に分割　時系列なら shuffle=False
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.2, random_state=42, shuffle=True)
+print(X_train.shape, X_test.shape)  # 例: (796, 5, 2) (199, 5, 2)
+
+# 4. Dataset / DataLoader 定義
+
+train_loader = DataLoader(TensorDataset(X_train, Y_train), batch_size=64, shuffle=True)
+test_loader  = DataLoader(TensorDataset(X_test,  Y_test),  batch_size=256, shuffle=False)
+
+# 5. モデル定義
+model = nn.Sequential(
+    nn.Linear(2, 64), nn.ReLU(),
+    nn.Linear(64, 64), nn.ReLU(),
+    nn.Linear(64, 2)
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+epochs    = 50
+train_loss_list = []
+val_loss_list = []
+loss_fn = nn.MSELoss()
+
+# 6. 学習ループ
+for epoch in range(1, epochs+1):
+    model.train()
+    total_loss = 0.0
+    for a_batch, u_batch in train_loader:    
+        a_batch = a_batch.to(device)  
+        u_batch = u_batch.to(device)  
+        optimizer.zero_grad()
+        pred = model(a_batch)
+        loss = loss_fn(pred, u_batch)
+        loss.backward()
+        optimizer.step()
+        
+        bs = a_batch.size(0)               # バッチサイズ
+        total_loss += loss.item() * len(a_batch)
+    train_loss = total_loss / len(train_loader)
+
+    # 検証
+    model.eval()
+    val_loss_sum, val_count = 0.0, 0
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            l = loss_fn(model(xb), yb).item()
+            bs = xb.size(0)
+            val_loss_sum += l * bs
+            val_count    += bs
+    val_loss = val_loss_sum / val_count
+    val_loss_list.append(val_loss)
+
+    if epoch % max(1, epochs//10) == 0:
+        print(f"[{epoch}/{epochs}] train MSE={train_loss:.6f} | val MSE={val_loss:.6f}")
+
+
+
+# 7. テスト & 可視化
+model.eval()
+with torch.no_grad():
+    for xb, yb in test_loader:
+        xb, yb = xb.to(device), yb.to(device)
+        l = loss_fn(model(xb), yb).item()
+        bs = xb.size(0)
+        val_loss_sum += l * bs
+        val_count    += bs
+val_loss = val_loss_sum / val_count
+
+
+# 学習終了後に損失曲線をプロット
+plt.plot(train_loss_list, label='Train Loss')
+plt.plot(val_loss_list, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss (MSE)')
+plt.title('FNO Training and Validation Loss')
+plt.legend()
+plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.tight_layout()
+plt.savefig("loss_curves.png")
+
+
+
+
+
+
+
