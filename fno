@@ -1,0 +1,1009 @@
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.loader import DataLoader
+from torch.utils.data import TensorDataset, DataLoader
+import torch.fft
+
+import matplotlib.pyplot as plt
+import scipy.io
+import h5py
+file_path = '/data/NavierStokes_V1e-5_N1200_T20.mat'
+# mat_contents = scipy.io.loadmat(file_path)
+# print(f"File loaded successfully: {"file_path")
+# print("Variables:", mat_contents.keys())
+
+class dataReader : #data reading & cuda, float32
+    def __init__(self, file_path, to_torch=True, to_cuda=False, to_float=True):
+        super().__init__()
+        self.to_torch = to_torch
+        self.to_cuda = to_cuda
+        self.to_float = to_float
+        self.file_path = file_path
+        self.data = None
+        self.old_mat = None
+        self._load_file()
+
+    def _load_file(self):
+        try:
+            self.data = scipy.io.loadmat(self.file_path)
+            self.old_mat = True
+        except:
+            self.data = h5py.File(self.file_path)
+            self.old_mat = False
+
+    def load_file(self, file_path):
+        self.file_path = file_path
+        self._load_file()
+
+    def read_field(self, field):
+        x = self.data[field]
+
+        if not self.old_mat:
+            x = x[()]
+            x = np.transpose(x, axes=range(len(x.shape) - 1, -1, -1))
+
+        if self.to_float:
+            x = x.astype(np.float32)
+
+        if self.to_torch:
+            x = torch.from_numpy(x)
+
+            if self.to_cuda:
+                x = x.cuda()
+        return x
+
+    def set_cuda(self, to_cuda):
+        self.to_cuda = to_cuda
+
+    def set_torch(self, to_torch):
+        self.to_torch = to_torch
+
+    def set_float(self, to_float):
+        self.to_float = to_float
+
+
+data = dataReader(file_path)
+a         = data.read_field('a')
+u         = data.read_field('u')
+t         = data.read_field('t')
+#前処理したほうが絶対良い！
+
+print(a.shape, u.shape, t.shape)
+print(a.dtype, u.dtype, t.dtype)
+
+# --- 訓練データ ---
+train_a = a[0:840].clone()
+train_u = u[0:840].clone()
+# --- 検証データ ---
+val_a   = a[840:1020].clone()
+val_u   = u[840:1020].clone()
+# --- テストデータ ---
+test_a  = a[1020:1200].clone()
+test_u  = u[1020:1200].clone()
+t_tensor = t.clone()
+#train_test_splitしたら良かったんじゃね
+mean_a = train_a.mean()
+std_a = train_a.std()
+train_a = (train_a - mean_a) / std_a
+val_a = (val_a - mean_a) / std_a
+test_a = (test_a - mean_a) / std_a
+
+mean_u = train_u.mean()
+std_u = train_u.std()
+train_u = (train_u - mean_u) / std_u
+val_u = (val_u - mean_u) / std_u
+test_u = (test_u - mean_u) / std_u
+
+# 時刻軸tは全体で共通なので、そのまま
+t_tensor = torch.tensor(t)   # (1, 20)
+
+# 3. DataLoader
+# ----------------------------
+batch_size = 32
+
+# 訓練用
+train_dataset = TensorDataset(train_a, train_u)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+# 検証用
+val_dataset = TensorDataset(val_a, val_u)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+# テスト用
+test_dataset = TensorDataset(test_a, test_u)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# 4. データの確認
+
+
+class ChannelMLP(nn.Module):
+    """ChannelMLP applies an arbitrary number of layers of 
+    1d convolution and nonlinearity to the channels of input
+    and is invariant to spatial resolution.
+
+    Parameters
+    ----------
+    in_channels : int
+    out_channels : int, default is None
+        if None, same is in_channels
+    hidden_channels : int, default is None
+        if None, same is in_channels
+    n_layers : int, default is 2
+        number of linear layers in the MLP
+    non_linearity : default is F.gelu
+    dropout : float, default is 0
+        if > 0, dropout probability
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels=64,
+        hidden_channels=64,
+        n_layers=2,
+        n_dim=2,
+        non_linearity=F.gelu,
+        dropout=0.0,
+        **kwargs,
+    ):
+        super().__init__()
+        self.n_layers = n_layers
+        self.in_channels = in_channels
+        self.out_channels = in_channels if out_channels is None else out_channels
+        self.hidden_channels = (
+            in_channels if hidden_channels is None else hidden_channels
+        )
+        self.non_linearity = non_linearity
+        self.dropout = (
+            nn.ModuleList([nn.Dropout(dropout) for _ in range(n_layers)])
+            if dropout > 0.0
+            else None
+        )
+        
+        # we use nn.Conv1d for everything and roll data along the 1st data dim
+        self.fcs = nn.ModuleList()
+        for i in range(n_layers):
+            if i == 0 and i == (n_layers - 1):
+                self.fcs.append(nn.Conv1d(self.in_channels, self.out_channels, 1))
+            elif i == 0:
+                self.fcs.append(nn.Conv1d(self.in_channels, self.hidden_channels, 1))
+            elif i == (n_layers - 1):
+                self.fcs.append(nn.Conv1d(self.hidden_channels, self.out_channels, 1))
+            else:
+                self.fcs.append(nn.Conv1d(self.hidden_channels, self.hidden_channels, 1))
+
+    def forward(self, x):
+        reshaped = False
+        size = list(x.shape)
+        if x.ndim > 3:  
+            # batch, channels, x1, x2... extra dims
+            # .reshape() is preferable but .view()
+            # cannot be called on non-contiguous tensors
+            x = x.reshape((*size[:2], -1)) 
+            reshaped = True
+
+        for i, fc in enumerate(self.fcs):
+            x = fc(x)
+            if i < self.n_layers - 1:
+                x = self.non_linearity(x)
+            if self.dropout is not None:
+                x = self.dropout[i](x)
+
+        # if x was an N-d tensor reshaped into 1d, undo the reshaping
+        # same logic as above: .reshape() handles contiguous tensors as well
+        if reshaped:
+            x = x.reshape((size[0], self.out_channels, *size[2:]))
+
+        return x
+
+from typing import List, Optional, Tuple, Union
+
+#from ..utils import validate_scaling_factor　　あとで復帰
+
+import tensorly as tl
+from tensorly.plugins import use_opt_einsum
+
+#from neuralop.layers.einsum_utils import einsum_complexhalf実行できなかったからファイルから取ってきた。
+import opt_einsum
+tl.set_backend('pytorch')
+use_opt_einsum('optimal')
+def einsum_complexhalf_two_input(eq, a, b):
+    """
+    Compute (two-input) einsum for complexhalf tensors.
+    Because torch.einsum currently does not support complex32 (complexhalf) types.
+    The inputs and outputs are the same as in torch.einsum
+    """
+    assert len(eq.split(',')) == 2, "Equation must have two inputs."
+
+    # cast both tensors to "view as real" form, and half precision
+    a = torch.view_as_real(a)
+    b = torch.view_as_real(b)
+    a = a.half()
+    b = b.half()
+
+    # create a new einsum equation that takes into account "view as real" form
+    input_output = eq.split('->')
+    new_output = 'xy' + input_output[1]
+    input_terms = input_output[0].split(',')
+    new_inputs = [input_terms[0] + 'x', input_terms[1] + 'y']
+    new_eqn = new_inputs[0] + ',' + new_inputs[1] + '->' + new_output
+
+    # convert back to complex form
+    tmp = tl.einsum(new_eqn, a, b)
+    res = torch.stack([tmp[0, 0, ...] - tmp[1, 1, ...], tmp[1, 0, ...] + tmp[0, 1, ...]], dim=-1)
+    return torch.view_as_complex(res)
+def einsum_complexhalf(eq, *args):
+    """
+    Compute einsum for complexhalf tensors.
+    Because torch.einsum currently does not support complex32 (complexhalf) types.
+    The inputs and outputs are the same as in torch.einsum
+    """
+    if len(args) == 2:
+        # if there are two inputs, it is faster to call this method
+        return einsum_complexhalf_two_input(eq, *args)
+
+    # find the optimal path
+    _, path_info = opt_einsum.contract_path(eq, *args)
+    partial_eqns = [contraction_info[2] for contraction_info in path_info.contraction_list]
+
+    # create a dict of the input tensors by their label in the einsum equation
+    tensors = {}
+    input_labels = eq.split('->')[0].split(',')
+    output_label = eq.split('->')[1]
+    tensors = dict(zip(input_labels,args))
+
+    # convert all tensors to half precision and "view as real" form
+    for key, tensor in tensors.items():
+        tensor = torch.view_as_real(tensor)
+        tensor = tensor.half()
+        tensors[key] = tensor
+
+    for partial_eq in partial_eqns:
+        # get the input tensors to partial_eq
+        in_labels, out_label = partial_eq.split('->')
+        in_labels = in_labels.split(',')
+        in_tensors = [tensors[label] for label in in_labels]
+
+        # create new einsum equation that takes into account "view as real" form
+        input_output = partial_eq.split('->')
+        new_output = 'xy' + input_output[1]
+        input_terms = input_output[0].split(',')
+        new_inputs = [input_terms[0] + 'x', input_terms[1] + 'y']
+        new_eqn = new_inputs[0] + ',' + new_inputs[1] + '->' + new_output
+
+        # perform the einsum, and convert to "view as real" form
+        tmp = tl.einsum(new_eqn, *in_tensors)
+        result = torch.stack([tmp[0, 0, ...] - tmp[1, 1, ...], tmp[1, 0, ...] + tmp[0, 1, ...]], dim=-1)
+        tensors[out_label] = result
+
+    return torch.view_as_complex(tensors[output_label])
+
+#from neuralop.layers.base_spectral_conv import BaseSpectralConv これ実行できなかったからファイルから取ってきた。
+class BaseSpectralConv(nn.Module):
+    def __init__(self, device=None, dtype=None):
+        """Base Class for Spectral Convolutions
+        
+        Use it when you want to build your own FNO-type Neural Operators
+        """
+        super().__init__()
+
+        self.dtype = dtype
+        self.device = device
+
+    def transform(self, x):
+        """Transforms an input x for a skip connection, by default just an identity map 
+
+        If your function transforms the input then you should also implement this transform method 
+        so the skip connection can also work. 
+
+        Typical usecases are:
+
+        * Your upsample or downsample the input in the Spectral conv: the skip connection has to be similarly scaled. 
+          This allows you to deal with it however you want (e.g. avoid aliasing)
+        * You perform a change of basis in your Spectral Conv, again, this needs to be applied to the skip connection too.
+        """
+        return x
+
+
+import itertools
+#from neuralop.layers.resample import resample　これ実行できなかったからファイルから取ってきた。
+def resample(x, res_scale, axis, output_shape=None):
+    """
+    A module for generic n-dimentional interpolation (Fourier resampling).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+            input activation of size (batch_size, channels, d1, ..., dN)
+    res_scale: int or tuple
+            Scaling factor along each of the dimensions in 'axis' parameter. If res_scale is scaler, then isotropic 
+            scaling is performed
+    axis: axis or dimensions along which interpolation will be performed.
+    output_shape : None or tuple[int]
+    """
+
+    if isinstance(res_scale, (float, int)):
+        if axis is None:
+            axis = list(range(2, x.ndim))
+            res_scale = [res_scale]*len(axis)
+        elif isinstance(axis, int):
+            axis = [axis]
+            res_scale = [res_scale]
+        else:
+              res_scale = [res_scale]*len(axis)
+    else:
+        assert len(res_scale) == len(axis), "leght of res_scale and axis are not same"
+
+    old_size = x.shape[-len(axis):]
+    if output_shape is None:
+        new_size = tuple([int(round(s*r)) for (s, r) in zip(old_size, res_scale)])
+    else:
+        new_size = output_shape
+
+    if len(axis) == 1:
+        return F.interpolate(x, size=new_size[0], mode='linear', align_corners=True)
+    if len(axis) == 2:
+        return F.interpolate(x, size=new_size, mode='bicubic', align_corners=True)
+
+    X = torch.fft.rfftn(x.float(), norm='forward', dim=axis)
+    
+    new_fft_size = list(new_size)
+    new_fft_size[-1] = new_fft_size[-1]//2 + 1 # Redundant last coefficient
+    new_fft_size_c = [min(i,j) for (i,j) in zip(new_fft_size, X.shape[-len(axis):])]
+    out_fft = torch.zeros([x.shape[0], x.shape[1], *new_fft_size], device=x.device, dtype=torch.cfloat)
+
+    mode_indexing = [((None, m//2), (-m//2, None)) for m in new_fft_size_c[:-1]] + [((None, new_fft_size_c[-1]), )]
+    for i, boundaries in enumerate(itertools.product(*mode_indexing)):
+
+        idx_tuple = [slice(None), slice(None)] + [slice(*b) for b in boundaries]
+
+        out_fft[idx_tuple] = X[idx_tuple]
+    y = torch.fft.irfftn(out_fft, s= new_size ,norm='forward', dim=axis)
+
+    return y
+def iterative_resample(x, res_scale, axis):
+    if isinstance(axis, list) and isinstance(res_scale, (float, int)):
+        res_scale = [res_scale]*len(axis)
+    if not isinstance(axis, list) and isinstance(res_scale,list):
+      raise Exception("Axis is not a list but Scale factors are")
+    if isinstance(axis, list) and isinstance(res_scale,list) and len(res_scale)!=len(axis):
+      raise Exception("Axis and Scal factor are in different sizes")
+
+    if isinstance(axis, list):
+        for i in range(len(res_scale)):
+            rs = res_scale[i]
+            a = axis[i]
+            x = resample(x, rs, a)
+        return x
+
+    old_res = x.shape[axis]
+    X = torch.fft.rfft(x, dim=axis, norm='forward')    
+    newshape = list(x.shape)
+    new_res = int(round(res_scale*newshape[axis]))
+    newshape[axis] = new_res // 2 + 1
+
+    Y = torch.zeros(newshape, dtype=X.dtype, device=x.device)
+
+    modes = min(new_res, old_res)
+    sl = [slice(None)] * x.ndim
+    sl[axis] = slice(0, modes // 2 + 1)
+    Y[tuple(sl)] = X[tuple(sl)]
+    y = torch.fft.irfft(Y, n=new_res, dim=axis,norm='forward')
+    return y
+
+
+
+
+
+
+
+
+
+einsum_symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+
+
+def _contract_dense(x, weight, separable=False):
+    order = tl.ndim(x)
+    # batch-size, in_channels, x, y...
+    x_syms = list(einsum_symbols[:order])
+
+    # in_channels, out_channels, x, y...
+    weight_syms = list(x_syms[1:])  # no batch-size
+
+    # batch-size, out_channels, x, y...
+    if separable:
+        out_syms = [x_syms[0]] + list(weight_syms)
+    else:
+        weight_syms.insert(1, einsum_symbols[order])  # outputs
+        out_syms = list(weight_syms)
+        out_syms[0] = x_syms[0]
+    
+    eq = f'{"".join(x_syms)},{"".join(weight_syms)}->{"".join(out_syms)}'
+
+    if not torch.is_tensor(weight):
+        weight = weight.to_tensor()
+
+    if x.dtype == torch.complex32:
+        # if x is half precision, run a specialized einsum
+        return einsum_complexhalf(eq, x, weight)
+    else:
+        return tl.einsum(eq, x, weight)
+
+def _contract_dense_separable(x, weight, separable):
+    if not torch.is_tensor(weight):
+        weight = weight.to_tensor()
+    return x * weight
+#5つの畳み込み方法をここで決める
+def get_contract_fun(weight, implementation="reconstructed", separable=False):
+    """Generic ND implementation of Fourier Spectral Conv contraction
+
+    Parameters
+    ----------
+    weight : tensorly-torch's FactorizedTensor
+    implementation : {'reconstructed', 'factorized'}, default is 'reconstructed'
+        whether to reconstruct the weight and do a forward pass (reconstructed)
+        or contract directly the factors of the factorized weight with the input (factorized)
+    separable: bool
+        if True, performs contraction with individual tensor factors. 
+        if False, 
+    Returns
+    -------
+    function : (x, weight) -> x * weight in Fourier space
+    """
+    if implementation == "reconstructed":
+        if separable:
+            return _contract_dense_separable
+        else:
+            return _contract_dense
+    elif implementation == "factorized":
+        # factorized時は常に _contract_dense を使う（分解を無視）
+        return _contract_dense
+    else:
+        raise ValueError(
+            f'Got implementation={implementation}, expected "reconstructed" or "factorized"'
+        )
+
+
+Number = Union[int, float]
+
+def validate_scaling_factor(
+    scaling_factor: Union[None, Number, List[Number], List[List[Number]]],
+    n_dim: int,
+    n_layers: Optional[int] = None,
+) -> Union[None, List[float], List[List[float]]]:
+    """
+    Parameters
+    ----------
+    scaling_factor : None OR float OR list[float] Or list[list[float]]
+    n_dim : int
+    n_layers : int or None; defaults to None
+        If None, return a single list (rather than a list of lists)
+        with `factor` repeated `dim` times.
+    """
+    if scaling_factor is None:
+        return None
+    if isinstance(scaling_factor, (float, int)):
+        if n_layers is None:
+            return [float(scaling_factor)] * n_dim
+
+        return [[float(scaling_factor)] * n_dim] * n_layers
+    
+    if (
+        isinstance(scaling_factor, list)
+        and len(scaling_factor) > 0
+        and all([isinstance(s, (float, int)) for s in scaling_factor])
+    ):
+        if n_layers is None and len(scaling_factor) == n_dim:
+            # this is a dim-wise scaling
+            return [float(s) for s in scaling_factor]
+        return [[float(s)] * n_dim for s in scaling_factor]
+
+    if (
+        isinstance(scaling_factor, list)
+        and len(scaling_factor) > 0
+        and all([isinstance(s, (list)) for s in scaling_factor])
+    ):
+        s_sub_pass = True
+        for s in scaling_factor:
+            if all([isinstance(s_sub, (int, float)) for s_sub in s]):
+                pass
+            else:
+                s_sub_pass = False
+            if s_sub_pass:
+                return scaling_factor
+
+    return None
+
+class SpectralConv(BaseSpectralConv):
+    """SpectralConv implements the Spectral Convolution component of a Fourier layer
+    described in [1]_ and [2]_.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels
+    out_channels : int
+        Number of output channels
+    n_modes : int or int tuple
+        Number of modes to use for contraction in Fourier domain during training.
+ 
+        .. warning::
+            
+            We take care of the redundancy in the Fourier modes, therefore, for an input 
+            of size I_1, ..., I_N, please provide modes M_K that are I_1 < M_K <= I_N
+            We will automatically keep the right amount of modes: specifically, for the 
+            last mode only, if you specify M_N modes we will use M_N // 2 + 1 modes 
+            as the real FFT is redundant along that last dimension. For more information on 
+            mode truncation, refer to :ref:`fourier_layer_impl`
+
+            
+        .. note::
+
+            Provided modes should be even integers. odd numbers will be rounded to the closest even number.  
+
+        This can be updated dynamically during training.
+
+    max_n_modes : int tuple or None, default is None
+        * If not None, **maximum** number of modes to keep in Fourier Layer, along each dim
+            The number of modes (`n_modes`) cannot be increased beyond that.
+        * If None, all the n_modes are used.
+
+    separable : bool, default is True
+        whether to use separable implementation of contraction
+        if True, contracts factors of factorized 
+        tensor weight individually
+    init_std : float or 'auto', default is 'auto'
+        std to use for the init
+    factorization : str or None, {'tucker', 'cp', 'tt'}, default is None
+        If None, a single dense weight is learned for the FNO.
+        Otherwise, that weight, used for the contraction in the Fourier domain
+        is learned in factorized form. In that case, `factorization` is the
+        tensor factorization of the parameters weight used.
+    rank : float or rank, optional
+        Rank of the tensor factorization of the Fourier weights, by default 1.0
+        Ignored if ``factorization is None``
+    fixed_rank_modes : bool, optional
+        Modes to not factorize, by default False
+        Ignored if ``factorization is None``
+    fft_norm : str, optional
+        fft normalization parameter, by default 'forward'
+    implementation : {'factorized', 'reconstructed'}, optional, default is 'factorized'
+        If factorization is not None, forward mode to use::
+        * `reconstructed` : the full weight tensor is reconstructed from the
+          factorization and used for the forward pass
+        * `factorized` : the input is directly contracted with the factors of
+          the decomposition
+        Ignored if ``factorization is None``
+    decomposition_kwargs : dict, optional, default is {}
+        Optionaly additional parameters to pass to the tensor decomposition
+        Ignored if ``factorization is None``
+    complex_data: bool, optional
+        whether data takes on complex values in the spatial domain, by default False
+        if True, uses different logic for FFT contraction and uses full FFT instead of real-valued
+    
+    References
+    -----------
+    .. [1] :
+
+    Li, Z. et al. "Fourier Neural Operator for Parametric Partial Differential 
+        Equations" (2021). ICLR 2021, https://arxiv.org/pdf/2010.08895.
+    
+    .. [2] :
+
+    Kossaifi, J., Kovachki, N., Azizzadenesheli, K., Anandkumar, A. "Multi-Grid
+        Tensorized Fourier Neural Operator for High-Resolution PDEs" (2024). 
+        TMLR 2024, https://openreview.net/pdf?id=AWiDlO63bH.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_modes,
+        complex_data=False,
+        max_n_modes=None,
+        bias=True,
+        separable=False,
+        resolution_scaling_factor: Optional[Union[Number, List[Number]]] = None,
+        fno_block_precision="full",
+        rank=0.5,
+        factorization=None,
+        implementation="reconstructed",
+        fixed_rank_modes=False,
+        decomposition_kwargs: Optional[dict] = None,
+        init_std="auto",
+        fft_norm="forward",
+        device=None,
+    ):
+        super().__init__(device=device)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.complex_data = complex_data
+
+        # n_modes is the total number of modes kept along each dimension
+        self.n_modes = n_modes
+        self.order = len(self.n_modes)
+
+        if max_n_modes is None:
+            max_n_modes = self.n_modes
+        elif isinstance(max_n_modes, int):
+            max_n_modes = [max_n_modes]
+        self.max_n_modes = max_n_modes
+
+        self.fno_block_precision = fno_block_precision
+        self.rank = rank
+        self.factorization = factorization
+        self.implementation = implementation
+
+        self.resolution_scaling_factor: Union[
+            None, List[List[float]]
+        ] = validate_scaling_factor(resolution_scaling_factor, self.order)
+
+        if init_std == "auto":
+            init_std = (2 / (in_channels + out_channels))**0.5
+        else:
+            init_std = init_std
+
+        if isinstance(fixed_rank_modes, bool):
+            if fixed_rank_modes:
+                # If bool, keep the number of layers fixed
+                fixed_rank_modes = [0]
+            else:
+                fixed_rank_modes = None
+        self.fft_norm = fft_norm
+
+        if factorization is None:
+            factorization = "Dense"  # No factorization
+
+        if separable:
+            if in_channels != out_channels:
+                raise ValueError(
+                    "To use separable Fourier Conv, in_channels must be equal "
+                    f"to out_channels, but got in_channels={in_channels} and "
+                    f"out_channels={out_channels}",
+                )
+            weight_shape = (in_channels, *max_n_modes)
+        else:
+            weight_shape = (in_channels, out_channels, *max_n_modes)
+        self.separable = separable
+
+        tensor_kwargs = decomposition_kwargs if decomposition_kwargs is not None else {}
+
+        # Create/init spectral weight tensor
+
+        # if factorization is None:　これいるか？
+        #     self.weight = torch.tensor(weight_shape, dtype=torch.cfloat)
+        # else:
+        #     self.weight = FactorizedTensor.new(weight_shape, rank=self.rank, 
+        #                              factorization=factorization, fixed_rank_modes=fixed_rank_modes,
+        #                              **tensor_kwargs, dtype=torch.cfloat) 
+        # self.weight.normal_(0, init_std)
+        
+        # self._contract = get_contract_fun(
+        #     self.weight, implementation=implementation, separable=separable
+        # )
+        self.weight = nn.Parameter(torch.randn(weight_shape, dtype=torch.cfloat) * init_std)
+        self._contract = _contract_dense  # 分解なし用の縮約関数を直接指定
+
+        if bias:
+            self.bias = nn.Parameter(
+                init_std * torch.randn(*(tuple([self.out_channels]) + (1,) * self.order))
+            )
+        else:
+            self.bias = None
+
+    def transform(self, x, output_shape=None):
+        in_shape = list(x.shape[2:])
+
+        if self.resolution_scaling_factor is not None and output_shape is None:
+            out_shape = tuple(
+                [round(s * r) for (s, r) in zip(in_shape, self.resolution_scaling_factor)]
+            )
+        elif output_shape is not None:
+            out_shape = output_shape
+        else:
+            out_shape = in_shape
+
+        if in_shape == out_shape:
+            return x
+        else:
+            return resample(x, 1.0, list(range(2, x.ndim)), output_shape=out_shape)
+    
+    @property
+    def n_modes(self):
+        return self._n_modes
+    
+    @n_modes.setter
+    def n_modes(self, n_modes):
+        if isinstance(n_modes, int): # Should happen for 1D FNO only
+            n_modes = [n_modes]
+        else:
+            n_modes = list(n_modes)
+        # the real FFT is skew-symmetric, so the last mode has a redundacy if our data is real in space 
+        # As a design choice we do the operation here to avoid users dealing with the +1
+        # if we use the full FFT we cannot cut off informtion from the last mode
+        if not self.complex_data:
+            n_modes[-1] = n_modes[-1] // 2 + 1
+        self._n_modes = n_modes
+
+    def forward(
+        self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None
+    ):
+        """Generic forward pass for the Factorized Spectral Conv
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            input activation of size (batch_size, channels, d1, ..., dN)
+
+        Returns
+        -------
+        tensorized_spectral_conv(x)
+        """
+        batchsize, channels, *mode_sizes = x.shape
+
+        fft_size = list(mode_sizes)
+        if not self.complex_data:
+            fft_size[-1] = fft_size[-1] // 2 + 1  # Redundant last coefficient in real spatial data
+        fft_dims = list(range(-self.order, 0))
+
+        if self.fno_block_precision == "half":
+            x = x.half()
+
+        if self.complex_data:
+            x = torch.fft.fftn(x, norm=self.fft_norm, dim=fft_dims)
+            dims_to_fft_shift = fft_dims
+        else: 
+            x = torch.fft.rfftn(x, norm=self.fft_norm, dim=fft_dims)
+            # When x is real in spatial domain, the last half of the last dim is redundant.
+            # See :ref:`fft_shift_explanation` for discussion of the FFT shift.
+            dims_to_fft_shift = fft_dims[:-1] 
+        
+        if self.order > 1:
+            x = torch.fft.fftshift(x, dim=dims_to_fft_shift)
+
+        if self.fno_block_precision == "mixed":
+            # if 'mixed', the above fft runs in full precision, but the
+            # following operations run at half precision
+            x = x.chalf()
+
+        if self.fno_block_precision in ["half", "mixed"]:
+            out_dtype = torch.chalf
+        else:
+            out_dtype = torch.cfloat
+        out_fft = torch.zeros([batchsize, self.out_channels, *fft_size],
+                              device=x.device, dtype=out_dtype)
+        
+        # if current modes are less than max, start indexing modes closer to the center of the weight tensor
+        starts = [(max_modes - min(size, n_mode)) for (size, n_mode, max_modes) in zip(fft_size, self.n_modes, self.max_n_modes)]
+        # if contraction is separable, weights have shape (channels, modes_x, ...)
+        # otherwise they have shape (in_channels, out_channels, modes_x, ...)
+        if self.separable: 
+            slices_w = [slice(None)] # channels
+        else:
+            slices_w =  [slice(None), slice(None)] # in_channels, out_channels
+        if self.complex_data:
+            slices_w += [slice(start//2, -start//2) if start else slice(start, None) for start in starts]
+        else:
+            # The last mode already has redundant half removed in real FFT
+            slices_w += [slice(start//2, -start//2) if start else slice(start, None) for start in starts[:-1]]
+            slices_w += [slice(None, -starts[-1]) if starts[-1] else slice(None)]
+        
+        weight = self.weight[slices_w]
+
+        ### Pick the first n_modes modes of FFT signal along each dim
+
+        # if separable conv, weight tensor only has one channel dim
+        if self.separable:
+            weight_start_idx = 1
+        # otherwise drop first two dims (in_channels, out_channels)
+        else:
+            weight_start_idx = 2
+        
+        slices_x =  [slice(None), slice(None)] # Batch_size, channels
+
+        for all_modes, kept_modes in zip(fft_size, list(weight.shape[weight_start_idx:])):
+            # After fft-shift, the 0th frequency is located at n // 2 in each direction
+            # We select n_modes modes around the 0th frequency (kept at index n//2) by grabbing indices
+            # n//2 - n_modes//2  to  n//2 + n_modes//2       if n_modes is even
+            # n//2 - n_modes//2  to  n//2 + n_modes//2 + 1   if n_modes is odd
+            center = all_modes // 2
+            negative_freqs = kept_modes // 2
+            positive_freqs = kept_modes // 2  + kept_modes % 2
+
+            # this slice represents the desired indices along each dim
+            slices_x += [slice(center - negative_freqs, center + positive_freqs)]
+        
+        if weight.shape[-1] < fft_size[-1]:
+            slices_x[-1] = slice(None, weight.shape[-1])
+        else:
+            slices_x[-1] = slice(None)
+        
+        out_fft[slices_x] = self._contract(x[slices_x], weight, separable=self.separable)
+
+        if self.resolution_scaling_factor is not None and output_shape is None:
+            mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])
+
+        if output_shape is not None:
+            mode_sizes = output_shape
+
+        if self.order > 1:
+            out_fft = torch.fft.fftshift(out_fft, dim=fft_dims[:-1])
+        
+        if self.complex_data:
+            x = torch.fft.ifftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
+        else:
+            x = torch.fft.irfftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
+
+        if self.bias is not None:
+            x = x + self.bias
+
+        return x
+
+
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Using', device)
+
+
+class FourierLayer(nn.Module):
+    def __init__(
+        self,
+        channels,
+        n_modes,
+        hidden_channels=None,
+        factorization=None,
+        rank=0.5,
+        **kwargs,
+    ):
+        super().__init__()
+        out_ch = channels
+        self.spectral_conv = SpectralConv(
+            in_channels=channels,
+            out_channels=out_ch,
+            n_modes=n_modes,
+            factorization=factorization,
+            rank=rank,
+            **kwargs,
+        )
+        self.w = nn.Conv2d(channels, out_ch, 1)
+        self.bn = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x):
+        x_spec = self.spectral_conv(x)
+        x_loc = self.w(x)
+        return F.gelu(self.bn(x_spec + x_loc))
+
+class FNO2d(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        n_modes=(16,16),
+        width=64,
+        depth=4,
+        factorization=None,
+        rank=0.5,
+        **kwargs,
+    ):
+        super().__init__()
+        self.lift = ChannelMLP(
+            in_channels,
+            out_channels=64,
+            hidden_channels=width,
+            n_layers=2,
+            n_dim=2,
+        )
+        self.layers = nn.ModuleList([
+            FourierLayer(width, n_modes, factorization=factorization, rank=rank, **kwargs)
+            for _ in range(depth)
+        ])
+        self.proj = ChannelMLP(
+            width,
+            out_channels,
+            hidden_channels=width,
+            n_layers=2,
+            n_dim=2,
+        )
+
+    def forward(self, a):
+        x = self.lift(a)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.proj(x)
+        return x
+    
+def add_grid(a_tensor):#３チャンネルにする。座標として機能させる
+    # a_tensor: [B, 1, H, W]
+    B, _, H, W = a_tensor.shape
+    y = torch.linspace(0, 1, H, device=a_tensor.device)
+    x = torch.linspace(0, 1, W, device=a_tensor.device)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    grid = torch.stack([yy, xx], dim=0)  # [2, H, W]
+    grid = grid.unsqueeze(0).repeat(B, 1, 1, 1)
+    return torch.cat([a_tensor, grid], dim=1)  # [B, 3, H, W]
+
+
+
+# --- Training Script ---
+model     = FNO2d(in_channels=3, out_channels=train_u.shape[-1], n_modes=(50,50), width=64, depth=30).to(device)
+loss_fn   = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+epochs    = 50
+train_loss_list = []
+val_loss_list = []
+
+for epoch in range(1, epochs+1):
+    model.train()
+    total_loss = 0.0
+    for a_batch, u_batch in train_loader:
+        
+        a_batch = a_batch.unsqueeze(1).to(device)  # [batch, 1, 64, 64]
+        a_batch = add_grid(a_batch).to(device)    # [B, 3, 64, 64] ←ここで座標付加
+        u_batch = u_batch.permute(0, 3, 1, 2).to(device)  # [batch, 20, 64, 64]
+        optimizer.zero_grad()
+        pred = model(a_batch)
+        loss = loss_fn(pred, u_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    train_loss = total_loss / len(train_loader)
+
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for a_batch, u_batch in val_loader:
+            a_batch = a_batch.unsqueeze(1).to(device)  # [batch, 1, 64, 64]
+            a_batch = add_grid(a_batch).to(device)    # [B, 3, 64, 64] ←ここで座標付加
+            u_batch = u_batch.permute(0, 3, 1, 2).to(device)  # [batch, 20, 64, 64]
+            val_loss += loss_fn(model(a_batch), u_batch).item()
+    val_loss /= len(val_loader)
+
+    train_loss_list.append(train_loss)
+    val_loss_list.append(val_loss)
+
+    print(f"Epoch {epoch}/{epochs} Train Loss: {train_loss:.6f} Val Loss: {val_loss:.6f}")
+
+# 学習終了後に損失曲線をプロット
+plt.plot(train_loss_list, label='Train Loss')
+plt.plot(val_loss_list, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss (MSE)')
+plt.title('FNO Training and Validation Loss')
+plt.legend()
+plt.grid(True, which="both", ls="--", alpha=0.4)
+plt.tight_layout()
+plt.savefig("loss_curves.png")
+
+
+
+
+# テストセットから1サンプル取得
+sample_a = test_a[0].unsqueeze(0).unsqueeze(1).to(device)  # [1, 1, 64, 64]
+sample_a_with_grid = add_grid(sample_a)                    # [1, 3, 64, 64]
+model.eval()
+with torch.no_grad():
+    pred_u = model(sample_a_with_grid)                     # [1, 20, 64, 64]
+pred_u = pred_u.squeeze(0).cpu().numpy()                   # [20, 64, 64]
+true_u = test_u[0].permute(2, 0, 1).cpu().numpy()          # [20, 64, 64]
+
+# 例：時刻0, 5, 10, 19を比較表示
+time_indices = [0, 5, 10, 19]
+fig, axes = plt.subplots(len(time_indices), 2, figsize=(6, 3*len(time_indices)))
+for i, t_idx in enumerate(time_indices):
+    axes[i, 0].imshow(true_u[t_idx], cmap='jet')
+    axes[i, 0].set_title(f"True u (t={t_idx})")
+    axes[i, 0].axis('off')
+    axes[i, 1].imshow(pred_u[t_idx], cmap='jet')
+    axes[i, 1].set_title(f"Pred u (t={t_idx})")
+    axes[i, 1].axis('off')
+plt.tight_layout()
+plt.savefig("pred_vs_true.png")
