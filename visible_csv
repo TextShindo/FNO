@@ -1,0 +1,29 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 読み込み
+df = pd.read_csv("practice.csv")
+
+# x座標（列名から取り出し）
+x = df.columns[2:].astype(float).to_numpy()   # 200, 600, 1000, ...
+
+# y座標
+y = df.iloc[0, 2:].astype(float).to_numpy()   # 200, 200, ... 3800
+# ただし全て200~3800のはず → 確認要
+
+# 温度データ
+T = df.iloc[1, 2:].astype(float).to_numpy()   # 1, 2, 3, ... 100
+
+# reshapeして10x10グリッドに
+X = x.reshape(10, 10)
+Y = y.reshape(10, 10)
+T_grid = T.reshape(10, 10)
+
+# プロット
+plt.pcolormesh(X, Y, T_grid, shading="auto", cmap="jet")
+plt.colorbar(label="Temperature")
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title("Temperature distribution from CSV")
+plt.show()
